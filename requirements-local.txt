@@ -1,0 +1,8 @@
+# Run this on your LOCAL Ubuntu machine (the one with cameras + GPU),
+# NOT on Render. This installs everything entry_cameras.py needs.
+
+opencv-python==4.13.*
+numpy<2.0
+insightface
+onnxruntime-gpu
+psycopg2-binary==2.9.9
