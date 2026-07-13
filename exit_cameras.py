@@ -476,7 +476,7 @@ def main():
                     (20, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.60, (0, 255, 255), 2)
 
-        # cv2.imshow("HR Face Attendance - EXIT GATE", display_frame)
+        cv2.imshow("HR Face Attendance - EXIT GATE", display_frame)
 
         if cv2.waitKey(1) & 0xFF == ord("q"):
             running = False
