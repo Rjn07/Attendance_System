@@ -594,6 +594,9 @@ def get_employee_photo(name):
 
 
 def sync_employee_photos_from_dir():
+    """Offline-safe: if Supabase is unreachable at startup, this just skips
+       and returns 0 instead of crashing main() (which used to trigger a
+       systemd crash-restart loop when the DGX had no internet at boot)."""
     import os as _os
 
     IMG_EXT = (".jpg", ".jpeg", ".png", ".webp")
@@ -601,43 +604,47 @@ def sync_employee_photos_from_dir():
         return 0
 
     updated = 0
-    conn = get_conn()
     try:
-        cur = conn.cursor()
-        for entry in sorted(_os.listdir(config.PHOTOS_DIR)):
-            emp_dir = _os.path.join(config.PHOTOS_DIR, entry)
-            if not _os.path.isdir(emp_dir):
-                continue
+        conn = get_conn()
+        try:
+            cur = conn.cursor()
+            for entry in sorted(_os.listdir(config.PHOTOS_DIR)):
+                emp_dir = _os.path.join(config.PHOTOS_DIR, entry)
+                if not _os.path.isdir(emp_dir):
+                    continue
 
-            photo_file = None
-            for fname in sorted(_os.listdir(emp_dir)):
-                fpath = _os.path.join(emp_dir, fname)
-                if _os.path.isfile(fpath) and fname.lower().endswith(IMG_EXT):
-                    photo_file = fname
-                    break
-            if not photo_file:
-                continue
+                photo_file = None
+                for fname in sorted(_os.listdir(emp_dir)):
+                    fpath = _os.path.join(emp_dir, fname)
+                    if _os.path.isfile(fpath) and fname.lower().endswith(IMG_EXT):
+                        photo_file = fname
+                        break
+                if not photo_file:
+                    continue
 
-            rel_path = f"{entry}/{photo_file}"
+                rel_path = f"{entry}/{photo_file}"
 
-            cur.execute("SELECT id, photo_path FROM employees WHERE name = %s", (entry,))
-            row = cur.fetchone()
-            if row is None:
-                cur.execute(
-                    "INSERT INTO employees (name, photo_path) VALUES (%s, %s)",
-                    (entry, rel_path),
-                )
-                updated += 1
-            elif not row["photo_path"]:
-                cur.execute(
-                    "UPDATE employees SET photo_path = %s WHERE id = %s",
-                    (rel_path, row["id"]),
-                )
-                updated += 1
-        conn.commit()
-        cur.close()
-    finally:
-        conn.close()
+                cur.execute("SELECT id, photo_path FROM employees WHERE name = %s", (entry,))
+                row = cur.fetchone()
+                if row is None:
+                    cur.execute(
+                        "INSERT INTO employees (name, photo_path) VALUES (%s, %s)",
+                        (entry, rel_path),
+                    )
+                    updated += 1
+                elif not row["photo_path"]:
+                    cur.execute(
+                        "UPDATE employees SET photo_path = %s WHERE id = %s",
+                        (rel_path, row["id"]),
+                    )
+                    updated += 1
+            conn.commit()
+            cur.close()
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"[db] sync_employee_photos_from_dir skipped (offline): {e}")
+        return 0
     return updated
 
 
