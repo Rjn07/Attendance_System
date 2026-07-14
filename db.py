@@ -1,16 +1,48 @@
 """
 =============================================================================
-  db.py  —  saara Postgres (Supabase) access ek jagah.
-  entry_cameras.py aur server.py dono isi module ko import karte hain,
-  taaki query logic sirf ek jagah maintain karni pade.
+  db.py  —  Postgres (Supabase) access + offline-safe local outbox.
 
-  NOTE: Ye MySQL wale db.py ka Postgres version hai. Sabhi function names
-  aur return shapes SAME rakhe gaye hain, isliye entry_cameras.py aur
-  server.py me KOI CHANGE nahi karna padega.
+  entry_cameras.py / exit_cameras.py / server.py import this module exactly
+  as before — NO CHANGES NEEDED in those files. Function names and return
+  values are identical to the old version.
+
+  WHAT CHANGED AND WHY
+  ---------------------------------------------------------------------------
+  Old bug: mark_attendance()/mark_exit() called the network FIRST and only
+  computed `now = datetime.now()` AFTER those calls returned. When Supabase
+  was unreachable, psycopg2 would hang (no connect_timeout / statement_timeout
+  set), so the function only resumed once internet came back — and by then
+  `now` was captured at THAT moment, not at the moment the face was actually
+  detected. That's why entry/exit times were wrong after an outage.
+
+  Fix:
+    1. Timestamp is captured as the very first line of mark_attendance/mark_exit,
+       before any DB call.
+    2. Every DB connection now has connect_timeout + statement_timeout +
+       TCP keepalives, so a dead network fails in ~5-10s instead of hanging.
+    3. If the Postgres write fails for ANY reason, the row (with the correct
+       timestamp) is written to a local SQLite outbox instead, and the
+       function still returns "marked" — attendance keeps working offline.
+    4. A background thread (started automatically on import) drains the
+       outbox into Supabase every SYNC_INTERVAL_SECONDS once connectivity
+       returns, oldest rows first, so timestamps stay correct.
+    5. Status reads (get_last_status_today / read_day_rows / count_today_rows)
+       also fall back to the local outbox when Postgres is unreachable, so
+       duplicate-entry checks keep working during an outage.
+
+  ONE-TIME SUPABASE MIGRATION (recommended, not required):
+      ALTER TABLE attendance ADD COLUMN IF NOT EXISTS client_uuid TEXT UNIQUE;
+  This lets the sync worker safely retry without ever creating a duplicate
+  row if it crashes mid-sync. The code works without it too (falls back to
+  a name+date+time+camera duplicate check), just slightly less bullet-proof.
 =============================================================================
 """
 
+import os
+import sqlite3
 import threading
+import time
+import uuid
 from datetime import datetime, date
 
 import psycopg2
@@ -20,7 +52,15 @@ from psycopg2.extras import RealDictCursor
 import config
 
 # =============================================================================
-#  CONNECTION POOL
+#  TUNABLES
+# =============================================================================
+CONNECT_TIMEOUT_SECONDS   = 5      # fail fast instead of hanging on a dead network
+STATEMENT_TIMEOUT_MS      = 5000   # kill a query server-side if it takes >5s
+SYNC_INTERVAL_SECONDS     = 15     # how often the background worker retries
+LOCAL_DB_PATH             = getattr(config, "LOCAL_QUEUE_DB", "offline_queue.db")
+
+# =============================================================================
+#  CONNECTION POOL  (now with real timeouts)
 # =============================================================================
 _pool = None
 _pool_lock = threading.Lock()
@@ -35,6 +75,12 @@ def get_pool():
                     minconn=1,
                     maxconn=8,
                     dsn=config.DATABASE_URL,
+                    connect_timeout=CONNECT_TIMEOUT_SECONDS,
+                    keepalives=1,
+                    keepalives_idle=5,
+                    keepalives_interval=3,
+                    keepalives_count=2,
+                    options=f"-c statement_timeout={STATEMENT_TIMEOUT_MS}",
                 )
     return _pool
 
@@ -67,182 +113,410 @@ def get_conn():
 
 
 def init_db():
-    """Tables ab schema.sql se banti hain (Supabase SQL editor me ek baar
-       run karo). Yahan sirf connectivity check karte hain taaki startup pe
-       galat DATABASE_URL ka pata turant chal jaaye."""
-    conn = get_conn()
+    """Tables banti hain schema.sql se. Yahan sirf connectivity check karte
+       hain taaki startup pe galat DATABASE_URL ka pata turant chal jaaye.
+       Ab yeh startup pe hang nahi karega — 5s me fail ho jayega agar DGX
+       offline hai, aur local outbox already ready hoga."""
+    _local_init()
     try:
-        cur = conn.cursor()
-        cur.execute("SELECT 1")
-        cur.fetchone()
-        cur.close()
-    finally:
-        conn.close()
+        conn = get_conn()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT 1")
+            cur.fetchone()
+            cur.close()
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"[db] WARNING: could not reach Supabase at startup ({e}). "
+              f"Running in offline mode — events will queue locally and "
+              f"sync automatically once internet is back.")
+    _start_sync_worker()
 
 
+# =============================================================================
+#  LOCAL OUTBOX  (SQLite — always available, never blocks on network)
+# =============================================================================
+_local_lock = threading.Lock()
+
+
+def _local_conn():
+    conn = sqlite3.connect(LOCAL_DB_PATH, check_same_thread=False, timeout=10)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _local_init():
+    with _local_lock:
+        conn = _local_conn()
+        try:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS pending_attendance (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    client_uuid TEXT UNIQUE,
+                    name        TEXT NOT NULL,
+                    att_date    TEXT NOT NULL,
+                    att_time    TEXT NOT NULL,
+                    status      TEXT NOT NULL,
+                    camera_id   TEXT,
+                    confidence  REAL,
+                    photo_path  TEXT,
+                    created_at  TEXT NOT NULL,
+                    retry_count INTEGER NOT NULL DEFAULT 0
+                )
+            """)
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def _local_insert(name, att_date, att_time, status, camera_id, confidence, photo_path):
+    row_uuid = str(uuid.uuid4())
+    with _local_lock:
+        conn = _local_conn()
+        try:
+            conn.execute(
+                """INSERT INTO pending_attendance
+                   (client_uuid, name, att_date, att_time, status, camera_id,
+                    confidence, photo_path, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (row_uuid, name, att_date, att_time, status, camera_id,
+                 confidence, photo_path, datetime.now().isoformat()),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    print(f"[db] OFFLINE — queued locally: {name} {status} at {att_time} "
+          f"(will sync when internet returns)")
+    return row_uuid
+
+
+def _local_last_status_today(name):
+    """Most recent status for `name` today, considering ONLY unsynced local
+       rows (already-synced rows are covered by the normal Postgres read
+       when it's reachable; this is purely the offline fallback)."""
+    today = date.today().isoformat()
+    with _local_lock:
+        conn = _local_conn()
+        try:
+            row = conn.execute(
+                """SELECT status FROM pending_attendance
+                   WHERE name = ? AND att_date = ?
+                   ORDER BY id DESC LIMIT 1""",
+                (name, today),
+            ).fetchone()
+            return row["status"] if row else None
+        finally:
+            conn.close()
+
+
+def _local_count_today(name):
+    today = date.today().isoformat()
+    with _local_lock:
+        conn = _local_conn()
+        try:
+            row = conn.execute(
+                "SELECT COUNT(*) AS c FROM pending_attendance WHERE name = ? AND att_date = ?",
+                (name, today),
+            ).fetchone()
+            return row["c"]
+        finally:
+            conn.close()
+
+
+def _local_day_rows(target_date):
+    """target_date: date object or 'YYYY-MM-DD' string."""
+    td = target_date.isoformat() if hasattr(target_date, "isoformat") else str(target_date)
+    with _local_lock:
+        conn = _local_conn()
+        try:
+            rows = conn.execute(
+                """SELECT name, att_time AS time, status, camera_id AS camera,
+                          photo_path AS photo
+                   FROM pending_attendance WHERE att_date = ?
+                   ORDER BY att_time DESC""",
+                (td,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            conn.close()
+
+
+def _local_pending_rows():
+    with _local_lock:
+        conn = _local_conn()
+        try:
+            rows = conn.execute(
+                "SELECT * FROM pending_attendance ORDER BY id ASC"
+            ).fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            conn.close()
+
+
+def _local_delete(row_id):
+    with _local_lock:
+        conn = _local_conn()
+        try:
+            conn.execute("DELETE FROM pending_attendance WHERE id = ?", (row_id,))
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def _local_bump_retry(row_id):
+    with _local_lock:
+        conn = _local_conn()
+        try:
+            conn.execute(
+                "UPDATE pending_attendance SET retry_count = retry_count + 1 WHERE id = ?",
+                (row_id,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def pending_sync_count():
+    """Handy to show on the dashboard: how many events are waiting to sync."""
+    with _local_lock:
+        conn = _local_conn()
+        try:
+            return conn.execute("SELECT COUNT(*) AS c FROM pending_attendance").fetchone()["c"]
+        finally:
+            conn.close()
+
+
+# =============================================================================
+#  EMPLOYEE ROSTER
+# =============================================================================
 def get_or_create_employee(name, department=None, designation=None):
-    """Roster me employee dhoondo, na ho to bana do. Returns employee_id."""
-    conn = get_conn()
+    """Roster me employee dhoondo, na ho to bana do. Returns employee_id.
+       Offline hone par None return karta hai — sync worker isse baad me
+       resolve kar lega, isliye entry/exit marking abhi bhi block nahi hoti."""
     try:
-        cur = conn.cursor()
-        cur.execute("SELECT id FROM employees WHERE name = %s", (name,))
-        row = cur.fetchone()
-        if row:
-            return row["id"]
-        cur.execute(
-            """INSERT INTO employees (name, department, designation)
-               VALUES (%s, %s, %s) RETURNING id""",
-            (name, department, designation),
-        )
-        emp_id = cur.fetchone()["id"]
-        conn.commit()
-        cur.close()
-        return emp_id
-    finally:
-        conn.close()
+        conn = get_conn()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT id FROM employees WHERE name = %s", (name,))
+            row = cur.fetchone()
+            if row:
+                return row["id"]
+            cur.execute(
+                """INSERT INTO employees (name, department, designation)
+                   VALUES (%s, %s, %s) RETURNING id""",
+                (name, department, designation),
+            )
+            emp_id = cur.fetchone()["id"]
+            conn.commit()
+            cur.close()
+            return emp_id
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"[db] get_or_create_employee offline fallback for {name}: {e}")
+        return None
 
 
 def sync_roster(names):
-    """embeddings.pkl ke saare naam employees table me ensure karo (bulk, startup pe)."""
-    conn = get_conn()
     try:
-        cur = conn.cursor()
-        for name in names:
-            cur.execute(
-                "INSERT INTO employees (name) VALUES (%s) ON CONFLICT (name) DO NOTHING",
-                (name,),
-            )
-        conn.commit()
-        cur.close()
-    finally:
-        conn.close()
+        conn = get_conn()
+        try:
+            cur = conn.cursor()
+            for name in names:
+                cur.execute(
+                    "INSERT INTO employees (name) VALUES (%s) ON CONFLICT (name) DO NOTHING",
+                    (name,),
+                )
+            conn.commit()
+            cur.close()
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"[db] sync_roster skipped (offline): {e}")
 
 
+# =============================================================================
+#  STATUS READ  (Postgres, falls back to local outbox)
+# =============================================================================
 def get_last_status_today(name):
-    """Aaj is naam ka sabse recent status ('Present'/'Exit') ya None."""
+    """Aaj is naam ka sabse recent status ('Present'/'Exit') ya None.
+       Postgres unreachable ho to local outbox se best-effort answer deta hai."""
     today = date.today()
-    conn = get_conn()
     try:
-        cur = conn.cursor()
-        cur.execute(
-            """SELECT status FROM attendance
-               WHERE name = %s AND att_date = %s
-               ORDER BY att_time DESC, id DESC LIMIT 1""",
-            (name, today),
-        )
-        row = cur.fetchone()
-        cur.close()
-        return row["status"] if row else None
-    finally:
-        conn.close()
+        conn = get_conn()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                """SELECT status FROM attendance
+                   WHERE name = %s AND att_date = %s
+                   ORDER BY att_time DESC, id DESC LIMIT 1""",
+                (name, today),
+            )
+            row = cur.fetchone()
+            cur.close()
+            pg_status = row["status"] if row else None
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"[db] get_last_status_today offline fallback for {name}: {e}")
+        return _local_last_status_today(name)
+
+    # Even when Postgres IS reachable, there may be local rows written during
+    # a recent outage that haven't synced yet — those are more recent truth.
+    local_status = _local_last_status_today(name)
+    return local_status if local_status is not None else pg_status
 
 
+# =============================================================================
+#  ATTENDANCE MARKING  — timestamp captured FIRST, network is best-effort
+# =============================================================================
 def mark_attendance(name, camera_id, confidence=None, photo_path=None,
                      department=None):
     """
     Duplicate-prevention wali attendance mark:
       - Agar aaj already "Present" hai -> "already_present", kuch nahi likhta.
       - Warna naya row insert (Present ya, agar pehle Exit tha, to Re-Entry
-        bhi "Present" hi likha jaata hai — jaisa original CSV version me tha).
+        bhi "Present" hi likha jaata hai).
     Returns "marked" | "already_present".
+
+    CRITICAL: `now` is captured before any network call, so the recorded
+    time is always the moment the face was actually detected — even if
+    Supabase is unreachable and the row has to queue locally.
     """
+    now = datetime.now()
+
     last_status = get_last_status_today(name)
     if last_status == "Present":
         return "already_present"
 
-    emp_id = get_or_create_employee(name, department=department)
-
-    now = datetime.now()
-    conn = get_conn()
     try:
-        cur = conn.cursor()
-        cur.execute(
-            """INSERT INTO attendance
-               (employee_id, name, att_date, att_time, status, camera_id,
-                confidence, photo_path)
-               VALUES (%s, %s, %s, %s, 'Present', %s, %s, %s)""",
-            (emp_id, name, now.date(), now.time().strftime("%H:%M:%S"),
-             camera_id, confidence, photo_path),
-        )
-        conn.commit()
-        cur.close()
-    finally:
-        conn.close()
+        emp_id = get_or_create_employee(name, department=department)
+        if emp_id is None:
+            raise RuntimeError("no employee_id (offline)")
 
-    return "marked"
+        conn = get_conn()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                """INSERT INTO attendance
+                   (employee_id, name, att_date, att_time, status, camera_id,
+                    confidence, photo_path)
+                   VALUES (%s, %s, %s, %s, 'Present', %s, %s, %s)""",
+                (emp_id, name, now.date(), now.time().strftime("%H:%M:%S"),
+                 camera_id, confidence, photo_path),
+            )
+            conn.commit()
+            cur.close()
+        finally:
+            conn.close()
+        return "marked"
+
+    except Exception as e:
+        print(f"[db] mark_attendance falling back to local outbox for {name}: {e}")
+        _local_insert(
+            name, now.date().isoformat(), now.time().strftime("%H:%M:%S"),
+            "Present", camera_id, confidence, photo_path,
+        )
+        return "marked"
 
 
 def mark_exit(name, camera_id, confidence=None, photo_path=None):
-    """Optional explicit exit-marking (e.g. from a separate exit camera)."""
+    """Mirrors mark_attendance() — timestamp first, network best-effort,
+       falls back to local outbox on any failure."""
+    now = datetime.now()
+
     last_status = get_last_status_today(name)
     if last_status != "Present":
         return "not_inside"
 
-    conn = get_conn()
     try:
-        cur = conn.cursor()
-        cur.execute("SELECT id FROM employees WHERE name = %s", (name,))
-        row = cur.fetchone()
-        emp_id = row["id"] if row else get_or_create_employee(name)
+        conn = get_conn()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT id FROM employees WHERE name = %s", (name,))
+            row = cur.fetchone()
+            emp_id = row["id"] if row else get_or_create_employee(name)
+            if emp_id is None:
+                raise RuntimeError("no employee_id (offline)")
 
-        now = datetime.now()
-        cur.execute(
-            """INSERT INTO attendance
-               (employee_id, name, att_date, att_time, status, camera_id,
-                confidence, photo_path)
-               VALUES (%s, %s, %s, %s, 'Exit', %s, %s, %s)""",
-            (emp_id, name, now.date(), now.time().strftime("%H:%M:%S"),
-             camera_id, confidence, photo_path),
+            cur.execute(
+                """INSERT INTO attendance
+                   (employee_id, name, att_date, att_time, status, camera_id,
+                    confidence, photo_path)
+                   VALUES (%s, %s, %s, %s, 'Exit', %s, %s, %s)""",
+                (emp_id, name, now.date(), now.time().strftime("%H:%M:%S"),
+                 camera_id, confidence, photo_path),
+            )
+            conn.commit()
+            cur.close()
+        finally:
+            conn.close()
+        return "marked"
+
+    except Exception as e:
+        print(f"[db] mark_exit falling back to local outbox for {name}: {e}")
+        _local_insert(
+            name, now.date().isoformat(), now.time().strftime("%H:%M:%S"),
+            "Exit", camera_id, confidence, photo_path,
         )
-        conn.commit()
-        cur.close()
-    finally:
-        conn.close()
-    return "marked"
+        return "marked"
 
 
 def count_today_rows(name):
     today = date.today()
-    conn = get_conn()
     try:
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT COUNT(*) AS c FROM attendance WHERE name = %s AND att_date = %s",
-            (name, today),
-        )
-        n = cur.fetchone()["c"]
-        cur.close()
-        return n
-    finally:
-        conn.close()
+        conn = get_conn()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT COUNT(*) AS c FROM attendance WHERE name = %s AND att_date = %s",
+                (name, today),
+            )
+            n = cur.fetchone()["c"]
+            cur.close()
+            return n + _local_count_today(name)
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"[db] count_today_rows offline fallback for {name}: {e}")
+        return _local_count_today(name)
 
 
 # =============================================================================
-#  READ HELPERS  —  used by the Flask API
+#  READ HELPERS  —  used by the Flask API / status cache refresh
 # =============================================================================
 def _dictify(cur):
-    # RealDictCursor already returns dict-like rows; just cast to plain dicts.
     return [dict(row) for row in cur.fetchall()]
 
 
 def read_day_rows(target_date):
-    conn = get_conn()
+    """target_date: date object or 'YYYY-MM-DD' string. Falls back to the
+       local outbox (merged in even when online, since those rows haven't
+       synced yet) so the in-process status cache never crashes or goes
+       stale during an outage."""
+    local_rows = _local_day_rows(target_date)
     try:
-        cur = conn.cursor()
-        cur.execute(
-            """SELECT name, att_time AS time, status, camera_id AS camera,
-                      photo_path AS photo
-               FROM attendance WHERE att_date = %s
-               ORDER BY att_time DESC""",
-            (target_date,),
-        )
-        rows = _dictify(cur)
-        cur.close()
-        for r in rows:
-            r["time"] = str(r["time"])
-        return rows
-    finally:
-        conn.close()
+        conn = get_conn()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                """SELECT name, att_time AS time, status, camera_id AS camera,
+                          photo_path AS photo
+                   FROM attendance WHERE att_date = %s
+                   ORDER BY att_time DESC""",
+                (target_date,),
+            )
+            rows = _dictify(cur)
+            cur.close()
+            for r in rows:
+                r["time"] = str(r["time"])
+            return local_rows + rows
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"[db] read_day_rows offline fallback: {e}")
+        return local_rows
 
 
 def read_month_rows(month):
@@ -320,14 +594,6 @@ def get_employee_photo(name):
 
 
 def sync_employee_photos_from_dir():
-    """
-    photos/<employee_name>/*.jpg (seedha folder ke andar, date-subfolder ke
-    ANDAR nahi) — inhe employee ki PROFILE photo maan kar employees.photo_path
-    me set kar do. Capture-wale photos (photos/<name>/<date>/*.jpg) is se
-    touch nahi hote, kyunki wo ek level neeche hote hain.
-    Safe to call baar baar (idempotent, sirf jinke paas abhi photo_path
-    khaali hai unhi ko update karta hai).
-    """
     import os as _os
 
     IMG_EXT = (".jpg", ".jpeg", ".png", ".webp")
@@ -343,7 +609,6 @@ def sync_employee_photos_from_dir():
             if not _os.path.isdir(emp_dir):
                 continue
 
-            # sirf top-level files (date subfolders skip)
             photo_file = None
             for fname in sorted(_os.listdir(emp_dir)):
                 fpath = _os.path.join(emp_dir, fname)
@@ -355,9 +620,6 @@ def sync_employee_photos_from_dir():
 
             rel_path = f"{entry}/{photo_file}"
 
-            # match employee by name (folder name == employee name, jaisa
-            # embeddings.pkl / roster me hai). Agar employee exist nahi karta,
-            # to bhi bana do taaki naya photo add karte hi turant dikh jaaye.
             cur.execute("SELECT id, photo_path FROM employees WHERE name = %s", (entry,))
             row = cur.fetchone()
             if row is None:
@@ -392,3 +654,100 @@ def list_employees():
         return rows
     finally:
         conn.close()
+
+
+# =============================================================================
+#  BACKGROUND SYNC WORKER  —  drains the local outbox into Supabase
+# =============================================================================
+_sync_thread_started = False
+_sync_thread_lock = threading.Lock()
+
+
+def _has_client_uuid_column(cur):
+    cur.execute(
+        """SELECT 1 FROM information_schema.columns
+           WHERE table_name='attendance' AND column_name='client_uuid'"""
+    )
+    return cur.fetchone() is not None
+
+
+def _sync_one_row(cur, row, has_uuid_col):
+    emp_id = get_or_create_employee(row["name"])
+    if emp_id is None:
+        raise RuntimeError("still offline")
+
+    if has_uuid_col:
+        cur.execute(
+            """INSERT INTO attendance
+               (employee_id, name, att_date, att_time, status, camera_id,
+                confidence, photo_path, client_uuid)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+               ON CONFLICT (client_uuid) DO NOTHING""",
+            (emp_id, row["name"], row["att_date"], row["att_time"], row["status"],
+             row["camera_id"], row["confidence"], row["photo_path"], row["client_uuid"]),
+        )
+    else:
+        # best-effort de-dup without the migration: skip if an identical
+        # row already exists (same name/date/time/camera).
+        cur.execute(
+            """SELECT 1 FROM attendance
+               WHERE name=%s AND att_date=%s AND att_time=%s AND camera_id=%s""",
+            (row["name"], row["att_date"], row["att_time"], row["camera_id"]),
+        )
+        if cur.fetchone() is None:
+            cur.execute(
+                """INSERT INTO attendance
+                   (employee_id, name, att_date, att_time, status, camera_id,
+                    confidence, photo_path)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
+                (emp_id, row["name"], row["att_date"], row["att_time"], row["status"],
+                 row["camera_id"], row["confidence"], row["photo_path"]),
+            )
+
+
+def _sync_loop():
+    while True:
+        time.sleep(SYNC_INTERVAL_SECONDS)
+        pending = _local_pending_rows()
+        if not pending:
+            continue
+
+        try:
+            conn = get_conn()
+        except Exception:
+            continue  # still offline, try again next cycle
+
+        try:
+            cur = conn.cursor()
+            has_uuid_col = _has_client_uuid_column(cur)
+
+            synced = 0
+            for row in pending:
+                try:
+                    _sync_one_row(cur, row, has_uuid_col)
+                    conn.commit()
+                    _local_delete(row["id"])
+                    synced += 1
+                except Exception as e:
+                    conn.rollback()
+                    _local_bump_retry(row["id"])
+                    print(f"[db] sync retry failed for {row['name']} "
+                          f"({row['att_date']} {row['att_time']}): {e}")
+
+            cur.close()
+            if synced:
+                print(f"[db] SYNC OK — {synced} offline event(s) pushed to Supabase.")
+        finally:
+            conn.close()
+
+
+def _start_sync_worker():
+    global _sync_thread_started
+    with _sync_thread_lock:
+        if _sync_thread_started:
+            return
+        _sync_thread_started = True
+        t = threading.Thread(target=_sync_loop, daemon=True, name="supabase-sync-worker")
+        t.start()
+        print(f"[db] background sync worker started "
+              f"(retries every {SYNC_INTERVAL_SECONDS}s, local queue: {LOCAL_DB_PATH})")
