@@ -1,3 +1,6 @@
+# 
+
+# ---------------------------------N---------------------------------------------------------------
 """
 =============================================================================
   db.py  —  Postgres (Supabase) access + offline-safe local outbox.
@@ -118,6 +121,7 @@ def init_db():
        Ab yeh startup pe hang nahi karega — 5s me fail ho jayega agar DGX
        offline hai, aur local outbox already ready hoga."""
     _local_init()
+    _local_log_init()
     try:
         conn = get_conn()
         try:
@@ -283,6 +287,51 @@ def pending_sync_count():
         conn = _local_conn()
         try:
             return conn.execute("SELECT COUNT(*) AS c FROM pending_attendance").fetchone()["c"]
+        finally:
+            conn.close()
+
+
+# =============================================================================
+#  DETECTION AUDIT LOG  —  every recognition event, regardless of outcome.
+#  This is a PURE LOCAL record (never synced to Supabase) whose only job is
+#  to give you an exact, independently-verifiable timestamp for every face
+#  the camera recognized — including "already_present" hits that never touch
+#  mark_attendance()/mark_exit() at all. Use this to audit real-world timing
+#  accuracy against what actually shows up in Supabase.
+# =============================================================================
+def _local_log_init():
+    with _local_lock:
+        conn = _local_conn()
+        try:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS detection_log (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name        TEXT NOT NULL,
+                    camera_id   TEXT,
+                    confidence  REAL,
+                    result      TEXT NOT NULL,
+                    event_time  TEXT NOT NULL
+                )
+            """)
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def log_detection(name, camera_id, confidence, result):
+    """Call this on EVERY recognized face above threshold, no matter what
+       happens next. Captures the exact moment of detection, independent of
+       any network/DB call, so you always have ground truth to check against."""
+    event_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
+    with _local_lock:
+        conn = _local_conn()
+        try:
+            conn.execute(
+                """INSERT INTO detection_log (name, camera_id, confidence, result, event_time)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (name, camera_id, confidence, result, event_time),
+            )
+            conn.commit()
         finally:
             conn.close()
 
