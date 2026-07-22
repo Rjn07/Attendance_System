@@ -1,1 +1,2 @@
 logs/
+`pip install flask-cors`
