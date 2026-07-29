@@ -479,14 +479,13 @@
         <input class="search" id="msearch" placeholder="Search name…" style="margin-left:12px; max-width:200px;">
       </div>
 
-      <!-- ── SUMMARY TABLE — Name + Present + Absent ── -->
+      <!-- ── SUMMARY TABLE — only Name + Present ── -->
       <div id="mv-summary">
         <div class="tbl-scroll" style="max-height:620px;">
           <table>
             <thead><tr>
               <th>Name</th>
               <th style="text-align:center;">Present</th>
-              <th style="text-align:center;">Absent</th>
             </tr></thead>
             <tbody id="mtbody"></tbody>
           </table>
@@ -728,6 +727,7 @@
   /* ===================== MONTHLY ===================== */
   function pctClass(p){ return p>=90 ? "hi" : p>=75 ? "mid" : "lo"; }
 
+  /* ── CHANGED: only Name + Present rendered, absent & bar removed ── */
   function renderMonthSummary(){
     const q = $("msearch").value.trim().toLowerCase();
     let emps = monthlyData.employees;
@@ -735,14 +735,13 @@
     emps = [...emps].sort((a,b)=>a.attendance_pct - b.attendance_pct);
     const tb = $("mtbody");
     if(!emps.length){
-      tb.innerHTML = `<tr><td colspan="3"><div class="empty"><p>No matching results</p></div></td></tr>`;
+      tb.innerHTML = `<tr><td colspan="2"><div class="empty"><p>No matching results</p></div></td></tr>`;
       return;
     }
     tb.innerHTML = emps.map(e=>`
       <tr>
         <td class="td-name">${e.name}</td>
         <td class="num-c" style="color:var(--teal)">${e.present_days}</td>
-        <td class="num-c" style="color:${e.absent_days?'var(--red)':'var(--muted)'}">${e.absent_days}</td>
       </tr>`
     ).join("");
   }
