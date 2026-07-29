@@ -1308,7 +1308,7 @@ click-to-enlarge photo lightbox
           <table>
             <thead><tr>
               <th>Name</th><th style="text-align:center;">Present</th>
-              <!-- <th style="text-align:center;">Absent</th><th style="text-align:center;">Avg Hrs</th><th>Attendance</th> -->
+              <!-- <th style="text-align:center;">Absent</th><th>Attendance</th> -->
             </tr></thead>
             <tbody id="mtbody"></tbody>
           </table>
@@ -1556,25 +1556,6 @@ click-to-enlarge photo lightbox
   /* ===================== MONTHLY ===================== */
   function pctClass(p){ return p>=90 ? "hi" : p>=75 ? "mid" : "lo"; }
 
-  // average hours worked across an employee's days that have both in & out
-  function empAvgHours(e){
-    if(!e.days) return null;
-    let total = 0, n = 0;
-    for(const d of (e.present_dates||[])){
-      const io = e.days[d];
-      if(!io) continue;
-      const a = toMinutes(io.in), b = toMinutes(io.out);
-      if(a === null || b === null || b < a) continue;
-      total += (b - a); n++;
-    }
-    return n ? total / n : null;
-  }
-  function fmtHours(mins){
-    if(mins === null) return "—";
-    const h = Math.floor(mins/60), m = Math.round(mins%60);
-    return `${h}h ${m}m`;
-  }
-
   function renderMonthSummary(){
     const q = $("msearch").value.trim().toLowerCase();
     let emps = monthlyData.employees;
@@ -1582,15 +1563,13 @@ click-to-enlarge photo lightbox
     // sort: lowest attendance first, since those need action
     emps = [...emps].sort((a,b)=>a.attendance_pct-b.attendance_pct);
     const tb = $("mtbody");
-    if(!emps.length){ tb.innerHTML = `<tr><td colspan="5"><div class="empty"><p>No matching results</p></div></td></tr>`; return; }
+    if(!emps.length){ tb.innerHTML = `<tr><td colspan="4"><div class="empty"><p>No matching results</p></div></td></tr>`; return; }
     tb.innerHTML = emps.map(e=>{
       const c = pctClass(e.attendance_pct);
-      const avg = fmtHours(empAvgHours(e));
       return `<tr>
         <td class="td-name">${e.name}</td>
         <td class="num-c" style="color:var(--teal)">${e.present_days}</td>
         <td class="num-c" style="color:${e.absent_days?'var(--red)':'var(--muted)'}">${e.absent_days}</td>
-        <td class="num-c" style="color:var(--muted)">${avg}</td>
         <td><div class="bar-wrap">
           <div class="mini-bar"><i class="fill-${c}" style="width:${e.attendance_pct}%"></i></div>
           <span class="pct ${c}">${e.attendance_pct}%</span>
