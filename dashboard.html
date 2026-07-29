@@ -479,13 +479,15 @@
         <input class="search" id="msearch" placeholder="Search name…" style="margin-left:12px; max-width:200px;">
       </div>
 
-      <!-- ── SUMMARY TABLE — only Name + Present ── -->
+      <!-- ── SUMMARY TABLE — Name + Present + Absent + Attendance % ── -->
       <div id="mv-summary">
         <div class="tbl-scroll" style="max-height:620px;">
           <table>
             <thead><tr>
               <th>Name</th>
               <th style="text-align:center;">Present</th>
+              <th style="text-align:center;">Absent</th>
+              <th>Attendance</th>
             </tr></thead>
             <tbody id="mtbody"></tbody>
           </table>
@@ -738,12 +740,18 @@
       tb.innerHTML = `<tr><td colspan="2"><div class="empty"><p>No matching results</p></div></td></tr>`;
       return;
     }
-    tb.innerHTML = emps.map(e=>`
-      <tr>
+    tb.innerHTML = emps.map(e=>{
+      const c = pctClass(e.attendance_pct);
+      return `<tr>
         <td class="td-name">${e.name}</td>
         <td class="num-c" style="color:var(--teal)">${e.present_days}</td>
-      </tr>`
-    ).join("");
+        <td class="num-c" style="color:${e.absent_days?'var(--red)':'var(--muted)'}">${e.absent_days}</td>
+        <td><div class="bar-wrap">
+          <div class="mini-bar"><i class="fill-${c}" style="width:${e.attendance_pct}%"></i></div>
+          <span class="pct ${c}">${e.attendance_pct}%</span>
+        </div></td>
+      </tr>`;
+    }).join("");
   }
 
   function renderMonthGrid(){
